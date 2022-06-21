@@ -1,0 +1,139 @@
+# Nextgen-Server pipeline
+schedules:
+- cron: "0 2 * * *"
+  displayName: Daily midnight build
+  branches:
+    include:
+    - develop
+
+variables:
+  - group: BD
+
+name: $(major).$(minor).$(maintenance)$(Rev:rrr)
+
+resources:
+  repositories:
+  - repository: NextGen-AVP-Server
+    type: git    
+    name: NextGen-AVP-Server
+    ref: develop
+    trigger:
+      branches:
+        include:
+          - master
+          - develop
+          - release/* 
+      paths:
+        include:
+          - NextGen-AVP-Server/*
+
+trigger:
+  branches:
+    include:
+      - master
+      - develop
+      - release/*    
+  paths:
+    include:
+      - NextGen-AVP-Server/*
+      - azure-ci-pipelines/avp-server-pipeline/*
+
+stages:
+  - stage: NextGen_Server_Continuous_Integration
+    jobs:
+      - job: NextGen_Server_Continuous_Integration
+        pool:
+          vmImage: 'ubuntu-20.04'
+        steps:
+        - checkout: self
+        - checkout: NextGen-AVP-Server
+
+        - task: DownloadSecureFile@1
+          name: MavenSettings
+          displayName: 'Download settings.xml'
+          inputs: 
+            secureFile: 'settings.xml'
+            
+        - script: 'curl -L -O https://download.java.net/java/GA/jdk11/9/GPL/openjdk-11.0.2_linux-x64_bin.tar.gz'
+          displayName: "Get Java version 11"
+
+        - task: JavaToolInstaller@0
+          displayName: "Set Java version to Java 11"
+          inputs:
+            versionSpec: "11"
+            jdkArchitectureOption: x64
+            jdkSourceOption: LocalDirectory
+            jdkFile: "openjdk-11.0.2_linux-x64_bin.tar.gz"
+            jdkDestinationDirectory: "/tmp/binaries/externals"
+            cleanDestinationDirectory: true
+
+        - script: 'java -version'
+          displayName: 'Print Java version'
+
+        - task: SonarQubePrepare@4
+          displayName: 'Prepare SonarQube for Code Coverage for AVP-Server'
+          inputs:
+            SonarQube: 'SonarQube'
+            scannerMode: 'Other'
+            extraProperties: |
+              sonar.projectBaseDir=.
+              sonar.projectVersion=$(Build.BuildNumber)
+              sonar.sourceEncoding=UTF-8
+              sonar.sources=src/main/java/com/varian/avp/nextgen
+              sonar.tests=src/test/java/com/varian/avp/nextgen
+              sonar.exclusions=src/test/**
+              sonar.jacoco.reportPaths=target/site/jacoco/jacoco.xml
+              sonar.coverage.jacoco.xmlReportPaths=NextGen-AVP-Server/target/site/jacoco/jacoco.xml
+              sonar.branch.name=$(Build.SourceBranchName)
+
+
+        - task: Maven@3
+          displayName: 'Build and Execuet JUnit Tests Of Nextgen Server'
+          inputs:
+            mavenPomFile: 'NextGen-AVP-Server/pom.xml'
+            goals: 'clean install sonar:sonar --settings $(MavenSettings.secureFilePath) -Davp.version=$(version) -Dsonar.projectKey=NextGen_Server'
+            publishJUnitResults: true
+            testResultsFiles: '**/surefire-reports/TEST-*.xml'
+            javaHomeOption: 'JDKVersion'
+            mavenVersionOption: 'Default'
+            mavenAuthenticateFeed: false
+            effectivePomSkip: false
+            sonarQubeRunAnalysis: true
+            sqMavenPluginVersionChoice: 'latest'
+
+        - task: PublishCodeCoverageResults@1
+          displayName: 'Publish Cobertura or JaCoCo code coverage results from a build'
+          inputs:
+            codeCoverageTool: 'JaCoCo' 
+            # Available options: 'JaCoCo', 'Cobertura'
+            summaryFileLocation: 'NextGen-AVP-Server/target/site/jacoco/jacoco.xml'
+            #pathToSources: # Optional
+            reportDirectory: 'NextGen-AVP-Server/target/site/jacoco'
+            #additionalCodeCoverageFiles: # Optional
+            #failIfCoverageEmpty: false # Optional
+
+        - task: SonarQubePublish@4
+          displayName: 'SonarQubeQualityGate'
+          inputs:
+            pollingTimeoutSec: '300'
+
+
+        - script: |
+            cp NextGen-AVP-Server/target/nextgen-server-1.0-SNAPSHOT.jar NextGen-AVP-Devops/azure-ci-pipelines/avp-server-pipeline/nextgen-server.jar
+            cp NextGen-AVP-Server/src/main/resources/log4j2.xml NextGen-AVP-Devops/azure-ci-pipelines/avp-server-pipeline/
+          displayName: 'Prerequisites for Docker Build'
+          
+        - task: Docker@2
+          displayName: 'Nextgen - Server: Docker Build And Push Image'
+          inputs:
+            containerRegistry: acr
+            repository: 'avp/nextgen/nextgen-server'
+            Dockerfile: 'NextGen-AVP-Devops/azure-ci-pipelines/avp-server-pipeline/Dockerfile'
+            buildContext: 'NextGen-AVP-Devops/azure-ci-pipelines/avp-server-pipeline'
+            tags: '$(Build.BuildNumber)'
+            addPipelineData: false
+
+        - script: 'bash <(curl -s -L https://detect.synopsys.com/detect.sh) --blackduck.url=https://varian.app.blackduck.com --blackduck.api.token=$(BlackDuckToken) --detect.project.name=NextGen-AVP-Server --detect.project.version.name=development --detect.code.location.name=NextGen-AVP-Server --detect.docker.image=devcorvms.azurecr.io/avp/nextgen/nextgen-server:$(Build.BuildNumber) --detect.bom.aggregate.name=TRUE --blackduck.trust.cert=true --detect.project.version.update=true --loggin.level.com.synompsys.integration=TRACE'
+          displayName: 'Black Duck Scan for AVP Server Docker Image'
+    #      condition: and(succeeded(), in(variables['Build.Reason'], 'Schedule', 'Manual'))
+          timeoutInMinutes: 40
